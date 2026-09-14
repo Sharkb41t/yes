@@ -10,11 +10,12 @@ each calendar month, and writes one output workbook to the "Output" folder.
   buy-in / cash market / main market variants - are ignored, per spec.
 - Month is derived from Trade Date (column AB, format yyyy-mm-dd).
 - September is always excluded from the summary.
-- Output: one sheet ("Monthly Volume Summary") with one stacked table per
-  month (ISIN | Instrument Description | Buy Volume (IDR) | Sell Volume (IDR)),
-  plus a second sheet ("USD-IDR FX Reference") listing the average USD/IDR
-  rate for each month shown, for reference only (not used in the calculation
-  since all trade values are already in IDR).
+- Output: one sheet ("Monthly Volume Summary") with one table per month laid
+  out horizontally, side by side (ISIN | Ticker | Instrument Description |
+  Buy Volume (IDR) | Sell Volume (IDR)), with a 1-column gap between each
+  month's table, plus a second sheet ("USD-IDR FX Reference") listing the
+  average USD/IDR rate for each month shown, for reference only (not used in
+  the calculation since all trade values are already in IDR).
 
 HOW TO RUN
 ----------
@@ -131,6 +132,7 @@ def load_file(path, file_label):
 
     isin = raw.iloc[:, COL_ISIN].astype(str).str.strip()
     desc = raw.iloc[:, COL_INSTRUMENT_DESC].astype(str).str.strip()
+    code = raw.iloc[:, COL_INSTRUMENT_CODE].astype(str).str.strip()
     side_raw = raw.iloc[:, COL_SIDE].astype(str).str.strip().str.upper()
     qty = pd.to_numeric(raw.iloc[:, COL_QTY_FILLED], errors="coerce")
     price = pd.to_numeric(raw.iloc[:, COL_GROSS_PRICE], errors="coerce")
@@ -156,6 +158,7 @@ def load_file(path, file_label):
 
     df = pd.DataFrame({
         "InstrumentDescription": desc,
+        "InstrumentCode": code,
         "ISIN": isin.astype("category"),
         "Side": side_raw.astype("category"),
         "Qty": qty,
@@ -255,9 +258,13 @@ def build_monthly_tables(df):
     df["ISIN"] = df["ISIN"].astype(str)
     df["Side"] = df["Side"].astype(str)
 
-    # One canonical description per ISIN (most common variant seen).
+    # One canonical description and ticker per ISIN (most common variant seen).
     isin_to_desc = (
         df.groupby("ISIN")["InstrumentDescription"]
+        .agg(lambda s: s.value_counts().idxmax())
+    )
+    isin_to_ticker = (
+        df.groupby("ISIN")["InstrumentCode"]
         .agg(lambda s: s.value_counts().idxmax())
     )
 
@@ -283,11 +290,12 @@ def build_monthly_tables(df):
             pivot["S"] = 0
 
         pivot["Instrument Description"] = pivot["ISIN"].map(isin_to_desc)
+        pivot["Ticker"] = pivot["ISIN"].map(isin_to_ticker)
         pivot = pivot.rename(columns={
             "B": "Buy Volume (IDR)",
             "S": "Sell Volume (IDR)",
         })
-        pivot = pivot[["ISIN", "Instrument Description", "Buy Volume (IDR)", "Sell Volume (IDR)"]]
+        pivot = pivot[["ISIN", "Ticker", "Instrument Description", "Buy Volume (IDR)", "Sell Volume (IDR)"]]
         pivot = pivot.sort_values("ISIN").reset_index(drop=True)
         tables[month] = pivot
 
@@ -314,7 +322,7 @@ def write_output(tables, out_path):
     log("Writing output workbook...")
     wb = Workbook()
 
-    # --- Sheet 1: Monthly Volume Summary ---
+    # --- Sheet 1: Monthly Volume Summary (tables laid out horizontally) ---
     ws = wb.active
     ws.title = "Monthly Volume Summary"
 
@@ -322,49 +330,63 @@ def write_output(tables, out_path):
     header_fill = PatternFill("solid", fgColor="4472C4")
     month_font = Font(name="Arial", bold=True, size=13)
     normal_font = Font(name="Arial")
-    col_widths = [18, 38, 22, 22]
+    bold_font = Font(name="Arial", bold=True)
 
-    for i, w in enumerate(col_widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+    # Each table is 5 columns wide (ISIN, Ticker, Description, Buy, Sell),
+    # followed by a 1-column gap before the next month's table.
+    col_widths = [18, 14, 38, 22, 22]
+    gap_width = 3
+    block_width = len(col_widths) + 1  # +1 for the gap column
+    headers = ["ISIN", "Ticker", "Instrument Description", "Buy Volume (IDR)", "Sell Volume (IDR)"]
 
-    row = 1
-    for month_key, table in tables.items():
+    for i, (month_key, table) in enumerate(tables.items()):
         log(f"  Writing table for {month_label(month_key)} ({len(table)} ISIN row(s))...")
-        ws.cell(row=row, column=1, value=month_label(month_key)).font = month_font
+        start_col = 1 + i * block_width
+
+        for j, w in enumerate(col_widths):
+            ws.column_dimensions[get_column_letter(start_col + j)].width = w
+        ws.column_dimensions[get_column_letter(start_col + len(col_widths))].width = gap_width
+
+        row = 1
+        ws.merge_cells(start_row=row, start_column=start_col,
+                        end_row=row, end_column=start_col + len(col_widths) - 1)
+        label_cell = ws.cell(row=row, column=start_col, value=month_label(month_key))
+        label_cell.font = month_font
+        label_cell.alignment = Alignment(horizontal="center")
         row += 1
 
-        headers = ["ISIN", "Instrument Description", "Buy Volume (IDR)", "Sell Volume (IDR)"]
-        for c, h in enumerate(headers, start=1):
-            cell = ws.cell(row=row, column=c, value=h)
+        for j, h in enumerate(headers):
+            cell = ws.cell(row=row, column=start_col + j, value=h)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
         row += 1
 
+        first_data_row = row
         for _, r in table.iterrows():
-            ws.cell(row=row, column=1, value=r["ISIN"]).font = normal_font
-            ws.cell(row=row, column=2, value=r["Instrument Description"]).font = normal_font
-            buy_cell = ws.cell(row=row, column=3, value=float(r["Buy Volume (IDR)"]))
-            sell_cell = ws.cell(row=row, column=4, value=float(r["Sell Volume (IDR)"]))
+            ws.cell(row=row, column=start_col, value=r["ISIN"]).font = normal_font
+            ws.cell(row=row, column=start_col + 1, value=r["Ticker"]).font = normal_font
+            ws.cell(row=row, column=start_col + 2, value=r["Instrument Description"]).font = normal_font
+            buy_cell = ws.cell(row=row, column=start_col + 3, value=float(r["Buy Volume (IDR)"]))
+            sell_cell = ws.cell(row=row, column=start_col + 4, value=float(r["Sell Volume (IDR)"]))
             buy_cell.font = normal_font
             sell_cell.font = normal_font
             buy_cell.number_format = "#,##0"
             sell_cell.number_format = "#,##0"
             row += 1
+        last_data_row = row - 1
 
         # Totals row for the month
-        total_row = row
-        ws.cell(row=total_row, column=2, value="Total").font = Font(name="Arial", bold=True)
-        first_data_row = total_row - len(table)
-        last_data_row = total_row - 1
+        ws.cell(row=row, column=start_col + 2, value="Total").font = bold_font
+        buy_col_letter = get_column_letter(start_col + 3)
+        sell_col_letter = get_column_letter(start_col + 4)
         if len(table):
-            ws.cell(row=total_row, column=3,
-                    value=f"=SUM(C{first_data_row}:C{last_data_row})").font = Font(name="Arial", bold=True)
-            ws.cell(row=total_row, column=4,
-                    value=f"=SUM(D{first_data_row}:D{last_data_row})").font = Font(name="Arial", bold=True)
-        ws.cell(row=total_row, column=3).number_format = "#,##0"
-        ws.cell(row=total_row, column=4).number_format = "#,##0"
-        row += 2  # blank row separator
+            ws.cell(row=row, column=start_col + 3,
+                    value=f"=SUM({buy_col_letter}{first_data_row}:{buy_col_letter}{last_data_row})").font = bold_font
+            ws.cell(row=row, column=start_col + 4,
+                    value=f"=SUM({sell_col_letter}{first_data_row}:{sell_col_letter}{last_data_row})").font = bold_font
+        ws.cell(row=row, column=start_col + 3).number_format = "#,##0"
+        ws.cell(row=row, column=start_col + 4).number_format = "#,##0"
 
     # --- Sheet 2: USD-IDR FX Reference ---
     log("  Writing USD-IDR FX Reference sheet...")
