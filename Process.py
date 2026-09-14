@@ -102,7 +102,19 @@ def load_file(path, file_label):
     counted and attributed to a specific reason - nothing is dropped quietly."""
     fname = os.path.basename(path)
     try:
-        raw = pd.read_excel(path, header=0)
+        raw = pd.read_excel(path, header=0, engine="calamine")
+    except ImportError:
+        # python-calamine not installed - fall back to openpyxl in read_only
+        # mode, which streams the file instead of loading the full workbook
+        # object model (much lower memory on large files). For a large
+        # speed-up on big files, install python-calamine:
+        #   pip install python-calamine
+        try:
+            raw = pd.read_excel(path, header=0, engine="openpyxl",
+                                 engine_kwargs={"read_only": True})
+        except Exception as e:
+            log(f"  [{file_label}] FAILED TO READ '{fname}': {e}. Skipping this file entirely.")
+            return None, {"read_error": 1}
     except Exception as e:
         log(f"  [{file_label}] FAILED TO READ '{fname}': {e}. Skipping this file entirely.")
         return None, {"read_error": 1}
@@ -144,8 +156,8 @@ def load_file(path, file_label):
 
     df = pd.DataFrame({
         "InstrumentDescription": desc,
-        "ISIN": isin,
-        "Side": side_raw,
+        "ISIN": isin.astype("category"),
+        "Side": side_raw.astype("category"),
         "Qty": qty,
         "Price": price,
         "TradeDate": trade_date,
@@ -178,7 +190,12 @@ def load_all_files(folder):
     total_reasons = defaultdict(int)
     n = len(files)
     for i, f in enumerate(files, start=1):
+        fname = os.path.basename(f)
+        log(f"  [{i}/{n}] Reading '{fname}' ...")
+        t_file = dt.datetime.now()
         df, reasons = load_file(f, file_label=f"{i}/{n}")
+        elapsed = (dt.datetime.now() - t_file).total_seconds()
+        log(f"  [{i}/{n}] '{fname}' processed in {elapsed:.1f}s")
         for k, v in reasons.items():
             total_reasons[k] += v
         if df is not None and len(df):
@@ -230,6 +247,13 @@ def build_monthly_tables(df):
     that ISIN. This avoids silently splitting one stock's volume across
     multiple rows if its description text varies slightly between files."""
     df = df[df["TradeDate"].dt.month != EXCLUDED_MONTH].copy()
+
+    # ISIN/Side were stored as category dtype to save memory during loading.
+    # Cast back to plain strings before grouping - categorical groupby keys
+    # can silently produce every unused category combination (observed=False
+    # is the pandas default), which would otherwise inflate row counts here.
+    df["ISIN"] = df["ISIN"].astype(str)
+    df["Side"] = df["Side"].astype(str)
 
     # One canonical description per ISIN (most common variant seen).
     isin_to_desc = (
