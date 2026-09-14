@@ -37,6 +37,9 @@ import datetime as dt
 from collections import defaultdict
 
 import pandas as pd
+
+def log(msg):
+    print(msg, flush=True)
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
@@ -92,58 +95,125 @@ def find_input_files(folder):
     return sorted(files)
 
 
-def load_file(path):
+def load_file(path, file_label):
     """Read one audit file and return a cleaned DataFrame with just the
     columns we need, using fixed column positions (not header names, since
-    header text may vary slightly between files)."""
-    raw = pd.read_excel(path, header=0)
+    header text may vary slightly between files). Every row dropped is
+    counted and attributed to a specific reason - nothing is dropped quietly."""
+    fname = os.path.basename(path)
+    try:
+        raw = pd.read_excel(path, header=0)
+    except Exception as e:
+        log(f"  [{file_label}] FAILED TO READ '{fname}': {e}. Skipping this file entirely.")
+        return None, {"read_error": 1}
 
     needed_max_idx = max(COL_INSTRUMENT_CODE, COL_INSTRUMENT_DESC, COL_ISIN,
                           COL_SIDE, COL_QTY_FILLED, COL_GROSS_PRICE, COL_TRADE_DATE)
     if raw.shape[1] <= needed_max_idx:
-        print(f"  WARNING: '{os.path.basename(path)}' has only {raw.shape[1]} "
-              f"columns (need at least {needed_max_idx + 1}). Skipping file.")
-        return None
+        log(f"  [{file_label}] WARNING: '{fname}' has only {raw.shape[1]} "
+            f"columns (need at least {needed_max_idx + 1}). Skipping file.")
+        return None, {"read_error": 1}
+
+    total_rows = len(raw)
+    log(f"  [{file_label}] '{fname}': {total_rows} data row(s) found. Validating...")
+
+    isin = raw.iloc[:, COL_ISIN].astype(str).str.strip()
+    desc = raw.iloc[:, COL_INSTRUMENT_DESC].astype(str).str.strip()
+    side_raw = raw.iloc[:, COL_SIDE].astype(str).str.strip().str.upper()
+    qty = pd.to_numeric(raw.iloc[:, COL_QTY_FILLED], errors="coerce")
+    price = pd.to_numeric(raw.iloc[:, COL_GROSS_PRICE], errors="coerce")
+    trade_date = pd.to_datetime(raw.iloc[:, COL_TRADE_DATE], errors="coerce")
+
+    # Diagnose *why* each row would be dropped, before actually dropping anything,
+    # so every exclusion is visible instead of silently disappearing.
+    reasons = {
+        "missing_isin": (raw.iloc[:, COL_ISIN].isna() | (isin == "") | (isin.str.lower() == "nan")).sum(),
+        "missing_or_invalid_side": (~side_raw.isin(["B", "S"])).sum(),
+        "invalid_qty": qty.isna().sum(),
+        "invalid_price": price.isna().sum(),
+        "invalid_trade_date": trade_date.isna().sum(),
+    }
+
+    valid_mask = (
+        (~(raw.iloc[:, COL_ISIN].isna() | (isin == "") | (isin.str.lower() == "nan")))
+        & side_raw.isin(["B", "S"])
+        & qty.notna()
+        & price.notna()
+        & trade_date.notna()
+    )
 
     df = pd.DataFrame({
-        "InstrumentCode": raw.iloc[:, COL_INSTRUMENT_CODE],
-        "InstrumentDescription": raw.iloc[:, COL_INSTRUMENT_DESC],
-        "ISIN": raw.iloc[:, COL_ISIN],
-        "Side": raw.iloc[:, COL_SIDE],
-        "Qty": pd.to_numeric(raw.iloc[:, COL_QTY_FILLED], errors="coerce"),
-        "Price": pd.to_numeric(raw.iloc[:, COL_GROSS_PRICE], errors="coerce"),
-        "TradeDate": pd.to_datetime(raw.iloc[:, COL_TRADE_DATE], errors="coerce"),
-    })
+        "InstrumentDescription": desc,
+        "ISIN": isin,
+        "Side": side_raw,
+        "Qty": qty,
+        "Price": price,
+        "TradeDate": trade_date,
+    })[valid_mask].copy()
 
-    before = len(df)
-    df = df.dropna(subset=["ISIN", "Side", "Qty", "Price", "TradeDate"])
-    dropped = before - len(df)
+    kept = len(df)
+    dropped = total_rows - kept
     if dropped:
-        print(f"  Note: '{os.path.basename(path)}' - dropped {dropped} row(s) "
-              f"with missing/invalid ISIN, Side, Qty, Price, or Trade Date.")
+        reason_str = ", ".join(f"{k}={v}" for k, v in reasons.items() if v)
+        log(f"  [{file_label}] '{fname}': kept {kept}, dropped {dropped} "
+            f"row(s) -> {reason_str}")
+    else:
+        log(f"  [{file_label}] '{fname}': kept all {kept} row(s), no issues found.")
 
-    df["Side"] = df["Side"].astype(str).str.strip().str.upper()
-    df = df[df["Side"].isin(["B", "S"])]
     df["Volume"] = df["Qty"] * df["Price"]
     df["Month"] = df["TradeDate"].dt.strftime("%Y-%m")
-    df["SourceFile"] = os.path.basename(path)
-    return df
+    df["SourceFile"] = fname
+    return df, reasons
 
 
 def load_all_files(folder):
     files = find_input_files(folder)
-    print(f"Found {len(files)} input file(s) in '{folder}':")
+    log(f"Found {len(files)} input file(s) in '{folder}':")
     for f in files:
-        print(f"  - {os.path.basename(f)}")
+        log(f"  - {os.path.basename(f)}")
+    log("")
+    log("Reading and validating files...")
 
     frames = []
-    for f in files:
-        df = load_file(f)
+    total_reasons = defaultdict(int)
+    n = len(files)
+    for i, f in enumerate(files, start=1):
+        df, reasons = load_file(f, file_label=f"{i}/{n}")
+        for k, v in reasons.items():
+            total_reasons[k] += v
         if df is not None and len(df):
             frames.append(df)
+
+    log("")
     if not frames:
         sys.exit("ERROR: No usable rows found across all input files.")
     combined = pd.concat(frames, ignore_index=True)
+
+    total_dropped = sum(v for k, v in total_reasons.items() if k != "read_error")
+    if total_dropped:
+        log(f"TOTAL rows dropped across all files: {total_dropped}")
+        for k, v in total_reasons.items():
+            if v and k != "read_error":
+                log(f"  - {k}: {v}")
+    if total_reasons.get("read_error"):
+        log(f"TOTAL files that could not be read at all: {total_reasons['read_error']}")
+    log(f"TOTAL valid rows loaded: {len(combined)}")
+    log("")
+
+    # Check for ISINs mapped to more than one distinct Instrument Description
+    # (whitespace already stripped) - this would previously have silently
+    # split the same stock's volume into separate summary rows.
+    desc_variants = combined.groupby("ISIN")["InstrumentDescription"].nunique()
+    inconsistent = desc_variants[desc_variants > 1]
+    if len(inconsistent):
+        log("WARNING: The following ISIN(s) appear with more than one distinct "
+            "Instrument Description across your files (all will still be combined "
+            "under a single ISIN row, using the most frequent description):")
+        for isin_code in inconsistent.index:
+            variants = combined.loc[combined["ISIN"] == isin_code, "InstrumentDescription"].unique()
+            log(f"  - {isin_code}: {list(variants)}")
+        log("")
+
     return combined
 
 
@@ -153,11 +223,22 @@ def load_all_files(folder):
 
 def build_monthly_tables(df):
     """Returns dict: month ('YYYY-MM') -> DataFrame[ISIN, Description, Buy, Sell]
-    sorted by month, with September excluded."""
+    sorted by month, with September excluded.
+
+    Grouping is strictly by ISIN (per spec) - Instrument Description is only
+    a display label, chosen as the most frequently occurring description for
+    that ISIN. This avoids silently splitting one stock's volume across
+    multiple rows if its description text varies slightly between files."""
     df = df[df["TradeDate"].dt.month != EXCLUDED_MONTH].copy()
 
+    # One canonical description per ISIN (most common variant seen).
+    isin_to_desc = (
+        df.groupby("ISIN")["InstrumentDescription"]
+        .agg(lambda s: s.value_counts().idxmax())
+    )
+
     grouped = (
-        df.groupby(["Month", "ISIN", "InstrumentDescription", "Side"])["Volume"]
+        df.groupby(["Month", "ISIN", "Side"])["Volume"]
         .sum()
         .reset_index()
     )
@@ -165,7 +246,7 @@ def build_monthly_tables(df):
     tables = {}
     for month, month_df in grouped.groupby("Month"):
         pivot = month_df.pivot_table(
-            index=["ISIN", "InstrumentDescription"],
+            index=["ISIN"],
             columns="Side",
             values="Volume",
             aggfunc="sum",
@@ -177,8 +258,8 @@ def build_monthly_tables(df):
         if "S" not in pivot.columns:
             pivot["S"] = 0
 
+        pivot["Instrument Description"] = pivot["ISIN"].map(isin_to_desc)
         pivot = pivot.rename(columns={
-            "InstrumentDescription": "Instrument Description",
             "B": "Buy Volume (IDR)",
             "S": "Sell Volume (IDR)",
         })
@@ -206,6 +287,7 @@ def month_label(month_key):
 
 
 def write_output(tables, out_path):
+    log("Writing output workbook...")
     wb = Workbook()
 
     # --- Sheet 1: Monthly Volume Summary ---
@@ -223,6 +305,7 @@ def write_output(tables, out_path):
 
     row = 1
     for month_key, table in tables.items():
+        log(f"  Writing table for {month_label(month_key)} ({len(table)} ISIN row(s))...")
         ws.cell(row=row, column=1, value=month_label(month_key)).font = month_font
         row += 1
 
@@ -260,6 +343,7 @@ def write_output(tables, out_path):
         row += 2  # blank row separator
 
     # --- Sheet 2: USD-IDR FX Reference ---
+    log("  Writing USD-IDR FX Reference sheet...")
     fx_ws = wb.create_sheet("USD-IDR FX Reference")
     fx_ws.column_dimensions["A"].width = 14
     fx_ws.column_dimensions["B"].width = 22
@@ -284,6 +368,7 @@ def write_output(tables, out_path):
         fx_ws.cell(row=r, column=3, value=FX_SOURCE_NOTE).font = Font(name="Arial", italic=True, size=9)
         r += 1
 
+    log(f"  Saving file to disk...")
     wb.save(out_path)
 
 
@@ -292,28 +377,45 @@ def write_output(tables, out_path):
 # ------------------------------------------------------------------------
 
 def main():
+    t0 = dt.datetime.now()
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-    print(f"Reading audit files from: {INPUT_FOLDER}")
+    log("=" * 60)
+    log("STEP 1/3: Loading and validating input files")
+    log("=" * 60)
+    log(f"Input folder:  {INPUT_FOLDER}")
+    log(f"Output folder: {OUTPUT_FOLDER}")
+    log("")
     combined = load_all_files(INPUT_FOLDER)
-    print(f"Total rows loaded: {len(combined)}")
 
+    log("=" * 60)
+    log("STEP 2/3: Aggregating by month and ISIN")
+    log("=" * 60)
     tables = build_monthly_tables(combined)
     if not tables:
         sys.exit("ERROR: No data left after excluding September / invalid rows.")
 
-    print(f"Months included: {', '.join(tables.keys())} (September excluded)")
+    for month_key, table in tables.items():
+        log(f"  {month_label(month_key)}: {len(table)} distinct ISIN(s)")
+    log(f"Months included: {', '.join(tables.keys())} (September excluded)")
 
     missing_fx = [m for m in tables if m not in FX_RATES_BY_MONTH]
     if missing_fx:
-        print(f"  NOTE: No FX rate on file for: {', '.join(missing_fx)}. "
-              f"These will show 'N/A' on the FX Reference sheet - add manually if needed.")
+        log(f"  NOTE: No FX rate on file for: {', '.join(missing_fx)}. "
+            f"These will show 'N/A' on the FX Reference sheet - add manually if needed.")
+    log("")
 
+    log("=" * 60)
+    log("STEP 3/3: Writing output workbook")
+    log("=" * 60)
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(OUTPUT_FOLDER, f"Monthly_Trade_Volume_Summary_{timestamp}.xlsx")
     write_output(tables, out_path)
 
-    print(f"\nDone. Output written to:\n  {out_path}")
+    elapsed = (dt.datetime.now() - t0).total_seconds()
+    log("")
+    log(f"Done in {elapsed:.1f}s. Output written to:")
+    log(f"  {out_path}")
 
 
 if __name__ == "__main__":
