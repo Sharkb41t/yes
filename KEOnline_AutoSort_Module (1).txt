@@ -1,0 +1,311 @@
+Public lastrow As Long
+
+Sub sort(column)
+
+    Columns(column).Select
+
+    ActiveSheet.sort.SortFields.Clear
+
+    ActiveSheet.sort.SortFields.Add Key:=Range(column & "1"), _
+        SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+
+    With ActiveWorkbook.ActiveSheet.sort
+        .SetRange Sheets(1).Range(Sheets(1).Cells(2, 1), Sheets(1).Cells(lastrow, 18))
+        .Header = xlNo
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .SortMethod = xlPinYin
+        .Apply
+    End With
+
+End Sub
+
+Sub LoadSelectedFiles()
+
+    Dim files As Variant
+    Dim f As Long
+    Dim srcWb As Workbook, srcWs As Worksheet
+    Dim tgt As Worksheet
+    Dim srcLast As Long, nextRow As Long
+    Dim headerDone As Boolean
+    Dim expectedMarket As String, thisMarket As String
+
+    ' --- multi-select file picker ---
+    files = Application.GetOpenFilename( _
+        FileFilter:="Excel Files (*.xls), *.xls", _
+        Title:="Select the trade files to load", _
+        MultiSelect:=True)
+
+    If Not IsArray(files) Then Exit Sub   ' user cancelled
+
+    Set tgt = ThisWorkbook.Sheets(1)
+
+    ' clear from row 2 down so the header we paste survives
+    tgt.Rows("2:" & tgt.Rows.Count).ClearContents
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    headerDone = False
+    expectedMarket = ""
+
+    For f = LBound(files) To UBound(files)
+
+        ' don't re-open the macro workbook itself
+        If files(f) <> ThisWorkbook.FullName Then
+
+            Set srcWb = Workbooks.Open(files(f))
+            Set srcWs = srcWb.Sheets(1)
+            srcLast = srcWs.Cells(srcWs.Rows.Count, "A").End(xlUp).Row
+
+            If srcLast >= 2 Then
+
+                ' --- market detection / validation from column C ---
+                thisMarket = UCase(Trim(srcWs.Range("C2").Value))
+
+                If thisMarket <> "HKG" And thisMarket <> "KLS" And thisMarket <> "SGX" Then
+                    MsgBox "File '" & srcWb.Name & "' has an unrecognised market code in C2: '" _
+                        & thisMarket & "'. Load aborted.", vbExclamation
+                    srcWb.Close SaveChanges:=False
+                    GoTo Abort
+                End If
+
+                If expectedMarket = "" Then
+                    expectedMarket = thisMarket
+                ElseIf thisMarket <> expectedMarket Then
+                    MsgBox "Market mismatch: expected " & expectedMarket & _
+                        " but file '" & srcWb.Name & "' is " & thisMarket & _
+                        ". All selected files must be the same market. Load aborted.", vbExclamation
+                    srcWb.Close SaveChanges:=False
+                    GoTo Abort
+                End If
+
+                ' copy header once, from the first data-bearing file
+                If Not headerDone Then
+                    srcWs.Range("A1:R1").Copy tgt.Range("A1")
+                    headerDone = True
+                End If
+
+                nextRow = tgt.Cells(tgt.Rows.Count, "A").End(xlUp).Row + 1
+                srcWs.Range("A2:R" & srcLast).Copy tgt.Cells(nextRow, "A")
+
+            End If
+
+            srcWb.Close SaveChanges:=False
+
+        End If
+
+    Next f
+
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+
+    If expectedMarket = "" Then
+        MsgBox "No data rows found in the selected files.", vbInformation
+        Exit Sub
+    End If
+
+    Call SortData
+
+    Exit Sub
+
+Abort:
+    ' wipe any partial data so SortData never runs on inconsistent input
+    tgt.Rows("2:" & tgt.Rows.Count).ClearContents
+    Application.DisplayAlerts = True
+    Application.ScreenUpdating = True
+
+End Sub
+
+Sub SortData()
+
+    lastrow = Range("A" & Rows.Count).End(xlUp).Row
+
+    Union(Columns("G"), Columns("I")).Delete Shift:=xlToLeft
+
+    Rows("2").Insert Shift:=xlDown
+
+    lastrow = Range("A" & Rows.Count).End(xlUp).Row
+
+    Range("G2:G" & lastrow).SpecialCells(xlCellTypeBlanks).EntireRow.Delete
+
+    lastrow = Range("A" & Rows.Count).End(xlUp).Row
+
+    Call sort("F")
+    Call sort("H")
+
+    ' buy sell update
+    Columns("F").Replace What:="sell", Replacement:="S", LookAt:=xlPart, _
+        SearchOrder:=xlByRows, MatchCase:=False, SearchFormat:=False, _
+        ReplaceFormat:=False
+
+    Columns("F").Replace What:="Buy", Replacement:="B", LookAt:=xlPart, _
+        SearchOrder:=xlByRows, MatchCase:=False, SearchFormat:=False, _
+        ReplaceFormat:=False
+
+    Columns("F").Insert Shift:=xlLeft
+
+    If Range("C2") = "HKG" Then
+        Range("F2:F" & lastrow).Formula = _
+            "=IF($E2<>"""",CONCATENATE(IFERROR(VLOOKUP($D2,Legend!$A:$B,2,FALSE),$E2),"".HK""),"""")"
+    ElseIf Range("C2") = "SGX" Then
+        Range("F2:F" & lastrow).Formula = _
+            "=IF($E2<>"""",CONCATENATE(IFERROR(VLOOKUP($D2,Legend!$A:$B,2,FALSE),$E2),"".SI""),"""")"
+    ElseIf Range("C2") = "KLS" Then
+        Range("F2:F" & lastrow).Formula = _
+            "=IF($E2<>"""",CONCATENATE(IFERROR(VLOOKUP($D2,Legend!$A:$B,2,FALSE),$E2),"".KL""),"""")"
+    End If
+
+    Range("F2:F" & lastrow).Copy
+    Range("E2").PasteSpecial Paste:=xlPasteValues, Operation:=xlNone, SkipBlanks _
+        :=False, Transpose:=False
+
+    Columns("F").Select
+    Selection.Delete Shift:=xlToLeft
+
+    Call Step2
+
+End Sub
+
+Sub Step2()
+
+    Dim number As String
+    Dim todayWeekday As Integer
+    Dim i As Long
+    Dim src As Worksheet, wsOut As Worksheet
+    Dim valueDate As Date
+
+    Set src = ThisWorkbook.Sheets(1)
+    lastrow = src.Range("A" & src.Rows.Count).End(xlUp).Row
+
+    ' --- remove Output (and any old BlockImport) sheet left over from an earlier run ---
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    ThisWorkbook.Sheets("Output").Delete
+    ThisWorkbook.Sheets("BlockImport").Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+
+    Set wsOut = ThisWorkbook.Sheets.Add(After:=src)
+    wsOut.Name = "Output"
+
+    src.Columns("F").Copy
+    wsOut.Columns("B").PasteSpecial Paste:=xlPasteValues, Operation:=xlNone, SkipBlanks _
+        :=False, Transpose:=False
+
+    src.Columns("H").Copy
+    wsOut.Columns("C").PasteSpecial Paste:=xlPasteValues, Operation:=xlNone, SkipBlanks _
+        :=False, Transpose:=False
+
+    src.Columns("E").Copy
+    wsOut.Columns("D").PasteSpecial Paste:=xlPasteValues, Operation:=xlNone, SkipBlanks _
+        :=False, Transpose:=False
+
+    src.Columns("P").Copy
+    wsOut.Columns("H").PasteSpecial Paste:=xlPasteValues, Operation:=xlNone, SkipBlanks _
+        :=False, Transpose:=False
+
+    ' put avg price first
+    src.Columns("G").Copy
+    wsOut.Columns("K").PasteSpecial Paste:=xlPasteValues, Operation:=xlNone, SkipBlanks _
+        :=False, Transpose:=False
+
+    Application.CutCopyMode = False
+    wsOut.Activate
+
+    i = 2
+    Do While i < lastrow + 1
+        number = src.Range("P" & i).Value
+        number = "'0" & number
+        wsOut.Range("H" & i).Value = number
+        i = i + 1
+    Loop
+
+    With wsOut
+        .Range("A1").Value = "Value date"
+        .Range("B1").Value = "Buy/Sell"
+        .Range("C1").Value = "Trade volume"
+        .Range("D1").Value = "Instrument"
+        .Range("E1").Value = "Instrument type"
+        .Range("F1").Value = "Average Price"
+        .Range("G1").Value = "Trading entity ID"
+        .Range("H1").Value = "Cpty"
+        .Range("I1").Value = "Counterparty type"
+        .Range("J1").Value = "Dealing capacity description"
+        .Range("K1").Value = "Gross price"
+        .Range("L1").Value = "Entered timestamp"
+
+        .Range("E2:E" & lastrow) = "VIEW"
+        .Range("F2:F" & lastrow) = "N"
+        .Range("G2:G" & lastrow) = "MBSG"
+        .Range("I2:I" & lastrow) = "C"
+        .Range("J2:J" & lastrow) = "AGENCY"
+
+        .Range("L2:L" & lastrow).NumberFormat = "@"
+        .Range("A2:A" & lastrow).NumberFormat = "General"
+    End With
+
+    todayWeekday = Weekday(Date)  ' Default: Sunday=1, Monday=2 ... Thursday=5, Friday=6
+    If todayWeekday = 5 Or todayWeekday = 6 Then  ' 5=Thursday, 6=Friday
+        valueDate = Date + 4
+    Else
+        valueDate = Date + 2
+    End If
+
+    ' Value date as a number (e.g. 20260924)
+    wsOut.Range("A2:A" & lastrow).Value = CLng(Format(valueDate, "yyyymmdd"))
+
+    ' Entered timestamp: today + fixed 15:00, +0800 offset
+    wsOut.Range("L2:L" & lastrow).Value = Format(Date, "yyyymmdd") & " 15:00:00.000000 +0800"
+
+    ' --- sort by Instrument, then Buy/Sell, then Cpty ---
+    With wsOut.sort
+        .SortFields.Clear
+        .SortFields.Add Key:=wsOut.Range("D2:D" & lastrow), SortOn:=xlSortOnValues, _
+            Order:=xlAscending, DataOption:=xlSortNormal
+        .SortFields.Add Key:=wsOut.Range("B2:B" & lastrow), SortOn:=xlSortOnValues, _
+            Order:=xlAscending, DataOption:=xlSortNormal
+        .SortFields.Add Key:=wsOut.Range("H2:H" & lastrow), SortOn:=xlSortOnValues, _
+            Order:=xlAscending, DataOption:=xlSortNormal
+        .SetRange wsOut.Range("A1:L" & lastrow)
+        .Header = xlYes
+        .MatchCase = False
+        .Orientation = xlTopToBottom
+        .Apply
+    End With
+
+    wsOut.Cells.HorizontalAlignment = xlCenter
+    wsOut.Range("A:L").EntireColumn.AutoFit
+
+    Call ExportOutput(wsOut)
+
+End Sub
+
+Sub ExportOutput(wsOut As Worksheet)
+
+    Dim newWb As Workbook
+    Dim exportPath As String
+
+    If ThisWorkbook.Path = "" Then
+        MsgBox "Save the macro workbook first so the Block Import file has a folder to go into. " & _
+            "The Output sheet was created but not exported.", vbExclamation
+        Exit Sub
+    End If
+
+    exportPath = ThisWorkbook.Path & Application.PathSeparator & _
+        "KEOnline Block Import " & Format(Date, "ddmmyyyy") & ".xlsx"
+
+    wsOut.Copy                     ' creates a new workbook holding only the Output sheet
+    Set newWb = ActiveWorkbook
+
+    Application.DisplayAlerts = False   ' overwrite a same-day file without prompting
+    newWb.SaveAs Filename:=exportPath, FileFormat:=xlOpenXMLWorkbook
+    Application.DisplayAlerts = True
+    newWb.Close SaveChanges:=False
+
+    ThisWorkbook.Activate
+    wsOut.Activate
+
+    MsgBox "Block Import exported to:" & vbCrLf & exportPath, vbInformation
+
+End Sub
