@@ -1,0 +1,491 @@
+Attribute VB_Name = "Mod_Netting"
+Option Explicit
+
+'===============================================================================
+' MODULE: Mod_Netting  (Indonesia adaptation - barebones single module)
+' Loads a system trade CSV + a client pairing Excel, reconciles them 1-to-1,
+' and builds a netted report. No dashboard, no buttons, no branding/formatting
+' beyond bold headers. Run Run_Netting() to execute everything.
+'===============================================================================
+
+' ---- CONFIG: edit these three things when adapting to a new market ----
+Private Const SETTLEMENT_CURRENCY As String = "IDR"
+
+Private Function CSVHeaders() As Variant
+    CSVHeaders = Array("Counterparty", "Entity", "Trade Date", "Settlement Date", _
+        "Buy/Sell", "Stock Description", "ISIN", "SEDOL", "Price", "Quantity", _
+        "Gross Proceeds", "Net Proceeds", "Commission", "Clearing Fee", _
+        "Stamp Duty", "Ex.Rate", "Settlement Currency", "Net Settlement Amount")
+End Function
+
+Private Function ClientHeaders() As Variant
+    ClientHeaders = Array("Order Type", "Security Number", "Quantity", _
+        "Net Settlement Amount", "Client Reference")
+End Function
+
+Private Function MapOrderTypeToBS(xOrder As String) As String
+    Select Case UCase(Trim(xOrder))
+        Case "DELIVERY VERSUS PAYMENT": MapOrderTypeToBS = "S"
+        Case "RECEIVE VERSUS PAYMENT": MapOrderTypeToBS = "B"
+        Case Else: MapOrderTypeToBS = ""
+    End Select
+End Function
+' ---- END CONFIG ----
+
+
+'===============================================================================
+' ENTRY POINT
+'===============================================================================
+Sub Run_Netting()
+    On Error GoTo Fail
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    LoadFiles
+    ValidateHeaders
+    SplitSecurityNumber
+    Reconcile
+    BuildNettingReport
+
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    MsgBox "Done. See NETTING_REPORT (and REJECTED_NETTING if any pairs failed).", vbInformation
+    Exit Sub
+
+Fail:
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    MsgBox "Stopped: " & Err.Description, vbCritical
+End Sub
+
+
+'===============================================================================
+' STEP 1 - LOAD
+'===============================================================================
+Sub LoadFiles()
+    Dim csvPath As Variant, xlsPath As Variant
+    Dim wsCSV As Worksheet, wsXLS As Worksheet, wbSource As Workbook
+
+    csvPath = Application.GetOpenFilename("CSV Files (*.csv), *.csv", , "Select System Trade Export CSV")
+    If csvPath = False Then Err.Raise vbObjectError + 1, , "No CSV selected"
+
+    xlsPath = Application.GetOpenFilename("Excel Files (*.xlsx;*.xlsm), *.xlsx;*.xlsm", , "Select Client Pairing Excel")
+    If xlsPath = False Then Err.Raise vbObjectError + 2, , "No Excel selected"
+
+    Set wsCSV = GetOrCreateSheet("SRC_CSV")
+    Set wsXLS = GetOrCreateSheet("SRC_XLSX")
+    wsCSV.Cells.Clear: wsXLS.Cells.Clear
+    ClearTables wsCSV: ClearTables wsXLS
+
+    With wsCSV.QueryTables.Add(Connection:="TEXT;" & csvPath, Destination:=wsCSV.Range("A1"))
+        .TextFileParseType = xlDelimited
+        .TextFileCommaDelimiter = True
+        .Refresh BackgroundQuery:=False
+        .Delete
+    End With
+    MakeTable wsCSV, "tblCSV"
+
+    Set wbSource = Workbooks.Open(CStr(xlsPath), ReadOnly:=True)
+    wbSource.Sheets(1).UsedRange.Copy wsXLS.Range("A1")
+    wbSource.Close SaveChanges:=False
+    MakeTable wsXLS, "tblXLSX"
+End Sub
+
+
+'===============================================================================
+' STEP 2 - VALIDATE HEADERS
+'===============================================================================
+Sub ValidateHeaders()
+    CheckHeaders ThisWorkbook.Worksheets("SRC_CSV").ListObjects("tblCSV"), CSVHeaders(), "System CSV"
+    CheckHeaders ThisWorkbook.Worksheets("SRC_XLSX").ListObjects("tblXLSX"), ClientHeaders(), "Client Excel"
+End Sub
+
+Private Sub CheckHeaders(tbl As ListObject, expected As Variant, label As String)
+    Dim i As Long
+    If tbl.ListColumns.Count <> UBound(expected) + 1 Then
+        Err.Raise vbObjectError + 10, , label & " header count mismatch. Expected " & _
+            (UBound(expected) + 1) & ", found " & tbl.ListColumns.Count
+    End If
+    For i = LBound(expected) To UBound(expected)
+        If Trim(tbl.ListColumns(i + 1).Name) <> expected(i) Then
+            Err.Raise vbObjectError + 11, , label & " header mismatch at column " & (i + 1) & _
+                ". Expected '" & expected(i) & "', found '" & tbl.ListColumns(i + 1).Name & "'"
+        End If
+    Next i
+End Sub
+
+
+'===============================================================================
+' STEP 3 - SPLIT "ISIN:CounterName"
+'===============================================================================
+Sub SplitSecurityNumber()
+    Dim tbl As ListObject, colCounter As ListColumn, rngSec As Range
+    Dim r As Long, parts As Variant
+
+    Set tbl = ThisWorkbook.Worksheets("SRC_XLSX").ListObjects("tblXLSX")
+
+    On Error Resume Next
+    Set colCounter = tbl.ListColumns("Counter Name")
+    On Error GoTo 0
+    If colCounter Is Nothing Then
+        Set colCounter = tbl.ListColumns.Add
+        colCounter.Name = "Counter Name"
+    End If
+
+    Set rngSec = tbl.ListColumns("Security Number").DataBodyRange
+    If rngSec Is Nothing Then Exit Sub
+
+    For r = 1 To rngSec.Rows.Count
+        If InStr(rngSec.Cells(r, 1).Value, ":") > 0 Then
+            parts = Split(rngSec.Cells(r, 1).Value, ":")
+            rngSec.Cells(r, 1).Value = Trim(parts(0))
+            colCounter.DataBodyRange.Cells(r, 1).Value = Trim(parts(1))
+        End If
+    Next r
+End Sub
+
+
+'===============================================================================
+' STEP 4 - RECONCILE (1-to-1, ISIN + Buy/Sell, best qty/amount match)
+'===============================================================================
+Sub Reconcile()
+    Dim tblX As ListObject, tblC As ListObject
+    Dim r As Long, cRow As Long, bestRow As Long, bestDiff As Double, diff As Double
+    Dim keyISIN As String, bs As String, cISIN As String, cBS As String
+    Dim xQty As Double, xAmt As Double, cQty As Double, cAmt As Double
+    Dim matched() As Boolean
+
+    Set tblX = ThisWorkbook.Worksheets("SRC_XLSX").ListObjects("tblXLSX")
+    Set tblC = ThisWorkbook.Worksheets("SRC_CSV").ListObjects("tblCSV")
+
+    On Error Resume Next
+    tblX.ListColumns("Fail Reason").Delete
+    tblX.ListColumns("Matched CSV Row").Delete
+    tblC.ListColumns("Reconciled").Delete
+    On Error GoTo 0
+    tblX.ListColumns.Add.Name = "Fail Reason"
+    tblX.ListColumns.Add.Name = "Matched CSV Row"
+    tblC.ListColumns.Add.Name = "Reconciled"
+
+    If tblC.DataBodyRange Is Nothing Then Exit Sub
+    ReDim matched(1 To tblC.DataBodyRange.Rows.Count)
+
+    For r = 1 To tblX.DataBodyRange.Rows.Count
+        keyISIN = Trim(tblX.ListColumns("Security Number").DataBodyRange.Cells(r, 1).Value)
+        bs = MapOrderTypeToBS(CStr(tblX.ListColumns("Order Type").DataBodyRange.Cells(r, 1).Value))
+
+        If bs = "" Then
+            tblX.ListColumns("Fail Reason").DataBodyRange.Cells(r, 1).Value = "UNKNOWN_ORDER_TYPE"
+            GoTo NextRow
+        End If
+
+        xQty = SafeCDbl(tblX.ListColumns("Quantity").DataBodyRange.Cells(r, 1).Value)
+        xAmt = SafeCDbl(tblX.ListColumns("Net Settlement Amount").DataBodyRange.Cells(r, 1).Value)
+
+        bestRow = 0: bestDiff = 9999999999#
+        For cRow = 1 To tblC.DataBodyRange.Rows.Count
+            If Not matched(cRow) Then
+                cISIN = Trim(CStr(tblC.ListColumns("ISIN").DataBodyRange.Cells(cRow, 1).Value))
+                cBS = UCase(Trim(CStr(tblC.ListColumns("Buy/Sell").DataBodyRange.Cells(cRow, 1).Value)))
+                If Len(cBS) > 0 Then cBS = Left(cBS, 1)
+
+                If cISIN = keyISIN And cBS = bs Then
+                    cQty = SafeCDbl(tblC.ListColumns("Quantity").DataBodyRange.Cells(cRow, 1).Value)
+                    cAmt = SafeCDbl(tblC.ListColumns("Net Settlement Amount").DataBodyRange.Cells(cRow, 1).Value)
+                    diff = Abs(xQty - cQty) * 1000000 + Abs(xAmt - cAmt)
+                    If bestRow = 0 Or diff < bestDiff Then
+                        bestDiff = diff: bestRow = cRow
+                    End If
+                End If
+            End If
+        Next cRow
+
+        If bestRow = 0 Then
+            tblX.ListColumns("Fail Reason").DataBodyRange.Cells(r, 1).Value = "NO_CSV_MATCH"
+            GoTo NextRow
+        End If
+
+        matched(bestRow) = True
+        tblX.ListColumns("Matched CSV Row").DataBodyRange.Cells(r, 1).Value = bestRow
+        tblC.ListColumns("Reconciled").DataBodyRange.Cells(bestRow, 1).Value = "YES"
+
+        If xQty <> SafeCDbl(tblC.ListColumns("Quantity").DataBodyRange.Cells(bestRow, 1).Value) Then
+            tblX.ListColumns("Fail Reason").DataBodyRange.Cells(r, 1).Value = "QUANTITY"
+        End If
+NextRow:
+    Next r
+End Sub
+
+
+'===============================================================================
+' STEP 5 - BUILD NETTING_REPORT (+ REJECTED_NETTING)
+'===============================================================================
+Sub BuildNettingReport()
+    Dim tblX As ListObject, tblC As ListObject, wsR As Worksheet, wsRej As Worksheet
+    Dim r As Long, outRow As Long, lastRow As Long
+    Dim matchedRow As Long
+
+    Set tblX = ThisWorkbook.Worksheets("SRC_XLSX").ListObjects("tblXLSX")
+    Set tblC = ThisWorkbook.Worksheets("SRC_CSV").ListObjects("tblCSV")
+
+    DeleteSheetIfExists "NETTING_REPORT"
+    Set wsR = Worksheets.Add
+    wsR.Name = "NETTING_REPORT"
+    wsR.Range("A1:M1").Value = Array("Settlements Date", "Trans Type", "COUNTER NAME", _
+        "Sedol", "ISIN", "Qty Trans", "Unit Price", "Settlement Amt", "Sett Qty", _
+        "ISS Sett Amt", "Net Off Amount", "Net Off Quantity", "Reject Reason")
+    wsR.Rows(1).Font.Bold = True
+
+    ' -- base rows from reconciled/unreconciled client requests --
+    outRow = 2
+    For r = 1 To tblX.DataBodyRange.Rows.Count
+        matchedRow = 0
+        On Error Resume Next
+        matchedRow = tblX.ListColumns("Matched CSV Row").DataBodyRange.Cells(r, 1).Value
+        On Error GoTo 0
+
+        If matchedRow > 0 Then
+            wsR.Cells(outRow, 1).Value = tblC.ListColumns("Settlement Date").DataBodyRange.Cells(matchedRow, 1).Value
+            wsR.Cells(outRow, 2).Value = tblC.ListColumns("Buy/Sell").DataBodyRange.Cells(matchedRow, 1).Value
+            wsR.Cells(outRow, 3).Value = tblX.ListColumns("Counter Name").DataBodyRange.Cells(r, 1).Value
+            wsR.Cells(outRow, 4).Value = tblC.ListColumns("SEDOL").DataBodyRange.Cells(matchedRow, 1).Value
+            wsR.Cells(outRow, 5).Value = tblC.ListColumns("ISIN").DataBodyRange.Cells(matchedRow, 1).Value
+            wsR.Cells(outRow, 6).Value = tblC.ListColumns("Quantity").DataBodyRange.Cells(matchedRow, 1).Value
+            wsR.Cells(outRow, 7).Value = tblC.ListColumns("Price").DataBodyRange.Cells(matchedRow, 1).Value
+            wsR.Cells(outRow, 8).Value = tblC.ListColumns("Net Settlement Amount").DataBodyRange.Cells(matchedRow, 1).Value
+        Else
+            wsR.Cells(outRow, 2).Value = MapOrderTypeToBS(CStr(tblX.ListColumns("Order Type").DataBodyRange.Cells(r, 1).Value))
+            wsR.Cells(outRow, 3).Value = tblX.ListColumns("Counter Name").DataBodyRange.Cells(r, 1).Value
+            wsR.Cells(outRow, 4).Value = tblX.ListColumns("Security Number").DataBodyRange.Cells(r, 1).Value
+            wsR.Cells(outRow, 6).Value = tblX.ListColumns("Quantity").DataBodyRange.Cells(r, 1).Value
+            wsR.Cells(outRow, 8).Value = tblX.ListColumns("Net Settlement Amount").DataBodyRange.Cells(r, 1).Value
+        End If
+        wsR.Cells(outRow, 13).Value = tblX.ListColumns("Fail Reason").DataBodyRange.Cells(r, 1).Value
+        outRow = outRow + 1
+    Next r
+
+    If outRow > 2 Then
+        wsR.Range(wsR.Cells(1, 1), wsR.Cells(outRow - 1, 13)).Sort _
+            Key1:=wsR.Cells(1, 3), Order1:=xlAscending, Header:=xlYes
+    End If
+
+    ' -- split failed/unmatched blocks into REJECTED_NETTING --
+    DeleteSheetIfExists "REJECTED_NETTING"
+    Set wsRej = Worksheets.Add
+    wsRej.Name = "REJECTED_NETTING"
+    wsR.Range("A1:M1").Copy wsRej.Range("A1")
+    Dim rejRow As Long: rejRow = 2
+
+    lastRow = wsR.Cells(wsR.Rows.Count, 3).End(xlUp).Row
+    r = 2
+    Do While r <= lastRow
+        If Trim(wsR.Cells(r, 3).Value) <> "" Then
+            Dim blockStart As Long, blockEnd As Long, i As Long, isFailed As Boolean
+            blockStart = r: blockEnd = r
+            Do While wsR.Cells(blockEnd + 1, 3).Value = wsR.Cells(r, 3).Value
+                blockEnd = blockEnd + 1
+            Loop
+
+            isFailed = False
+            For i = blockStart To blockEnd
+                If Trim(wsR.Cells(i, 13).Value) <> "" Then isFailed = True: Exit For
+            Next i
+
+            If Not isFailed Then
+                If (blockEnd - blockStart + 1) <> 2 Then
+                    isFailed = True
+                    For i = blockStart To blockEnd
+                        If Trim(wsR.Cells(i, 13).Value) = "" Then wsR.Cells(i, 13).Value = "UNMATCHED_PAIR_COUNT"
+                    Next i
+                ElseIf wsR.Cells(blockStart, 2).Value = wsR.Cells(blockEnd, 2).Value Then
+                    isFailed = True
+                    For i = blockStart To blockEnd
+                        If Trim(wsR.Cells(i, 13).Value) = "" Then wsR.Cells(i, 13).Value = "SAME_DIRECTION_TRADES"
+                    Next i
+                End If
+            End If
+
+            If isFailed Then
+                wsR.Range(wsR.Rows(blockStart), wsR.Rows(blockEnd)).Copy wsRej.Rows(rejRow)
+                rejRow = rejRow + (blockEnd - blockStart + 1)
+                wsR.Range(wsR.Rows(blockStart), wsR.Rows(blockEnd)).Delete xlShiftUp
+                lastRow = lastRow - (blockEnd - blockStart + 1)
+            Else
+                r = blockEnd + 1
+            End If
+        Else
+            r = r + 1
+        End If
+    Loop
+
+    ' -- Sett Qty (col 9) --
+    lastRow = wsR.Cells(wsR.Rows.Count, 3).End(xlUp).Row
+    r = 2
+    Do While r < lastRow
+        If wsR.Cells(r, 3).Value = wsR.Cells(r + 1, 3).Value Then
+            Dim q1 As Double, q2 As Double
+            q1 = wsR.Cells(r, 6).Value: q2 = wsR.Cells(r + 1, 6).Value
+            If q1 > q2 Then wsR.Cells(r, 9).Value = q1 - q2
+            If q2 > q1 Then wsR.Cells(r + 1, 9).Value = q2 - q1
+            r = r + 2
+        Else
+            r = r + 1
+        End If
+    Loop
+
+    ' -- ISS Sett Amt (col 10) --
+    For r = 2 To lastRow
+        If wsR.Cells(r, 9).Value <> "" And wsR.Cells(r, 9).Value <> 0 Then
+            wsR.Cells(r, 10).Value = Round((wsR.Cells(r, 8).Value / wsR.Cells(r, 6).Value) * wsR.Cells(r, 9).Value, 2)
+        End If
+    Next r
+
+    ' -- Net Off Amount (col 11) --
+    For r = 2 To lastRow
+        If wsR.Cells(r, 9).Value = "" Or wsR.Cells(r, 9).Value = 0 Then
+            wsR.Cells(r, 11).Value = Round(Abs(wsR.Cells(r, 8).Value), 2)
+        Else
+            wsR.Cells(r, 11).Value = Round(Abs((wsR.Cells(r, 6).Value - wsR.Cells(r, 9).Value) * _
+                (wsR.Cells(r, 8).Value / wsR.Cells(r, 6).Value)), 2)
+        End If
+    Next r
+
+    ' -- NET: row per pair + grand total, tagged DVP (shares move) / FOP (cash only) --
+    Dim DVP_FILL As Long, FOP_FILL As Long, DVP_TEXT As Long, FOP_TEXT As Long
+    DVP_FILL = RGB(255, 224, 178)   ' amber  - a residual quantity still needs delivery
+    FOP_FILL = RGB(214, 234, 248)   ' blue   - quantities fully net off, cash only
+    DVP_TEXT = RGB(191, 87, 0)
+    FOP_TEXT = RGB(21, 67, 96)
+
+    Dim grandTotal As Double: grandTotal = 0
+    r = 2
+    Do While r <= lastRow
+        If wsR.Cells(r, 3).Value = wsR.Cells(r + 1, 3).Value Then
+            Dim buyAmt As Double, sellAmt As Double, netDiff As Double
+            If UCase(Trim(wsR.Cells(r, 2).Value)) = "S" Then
+                sellAmt = wsR.Cells(r, 11).Value: buyAmt = wsR.Cells(r + 1, 11).Value
+            Else
+                buyAmt = wsR.Cells(r, 11).Value: sellAmt = wsR.Cells(r + 1, 11).Value
+            End If
+            netDiff = Round(sellAmt - buyAmt, 2)
+
+            ' DVP if either leg still has a residual quantity left to physically deliver
+            Dim isDVP As Boolean
+            isDVP = (wsR.Cells(r, 9).Value <> "" And wsR.Cells(r, 9).Value <> 0) Or _
+                    (wsR.Cells(r + 1, 9).Value <> "" And wsR.Cells(r + 1, 9).Value <> 0)
+
+            wsR.Rows(r + 2).Insert Shift:=xlDown
+            wsR.Cells(r + 2, 10).Value = "NET:"
+            wsR.Cells(r + 2, 11).Value = netDiff
+            wsR.Range(wsR.Cells(r + 2, 10), wsR.Cells(r + 2, 11)).Font.Bold = True
+            grandTotal = grandTotal + netDiff
+
+            ' Shade the whole pair block (both legs + NET row) and stamp the tag
+            ' on the NET row's Sett Qty cell, which is otherwise always blank there.
+            Dim blockRng As Range
+            Set blockRng = wsR.Range(wsR.Cells(r, 1), wsR.Cells(r + 2, 12))
+            If isDVP Then
+                blockRng.Interior.Color = DVP_FILL
+                wsR.Cells(r + 2, 9).Value = "DVP"
+                wsR.Cells(r + 2, 9).Font.Bold = True
+                wsR.Cells(r + 2, 9).Font.Color = DVP_TEXT
+            Else
+                blockRng.Interior.Color = FOP_FILL
+                wsR.Cells(r + 2, 9).Value = "FOP"
+                wsR.Cells(r + 2, 9).Font.Bold = True
+                wsR.Cells(r + 2, 9).Font.Color = FOP_TEXT
+            End If
+
+            wsR.Rows(r + 3).Insert Shift:=xlDown
+            r = r + 4: lastRow = lastRow + 2
+        Else
+            r = r + 1
+        End If
+    Loop
+
+    ' -- Net Off Quantity (col 12) --
+    r = 2
+    Do While r < lastRow
+        If wsR.Cells(r, 3).Value = wsR.Cells(r + 1, 3).Value And Trim(wsR.Cells(r, 3).Value) <> "" Then
+            Dim minQty As Double
+            minQty = Application.WorksheetFunction.Min(wsR.Cells(r, 6).Value, wsR.Cells(r + 1, 6).Value)
+            If minQty <> 0 Then
+                wsR.Cells(r, 12).Value = -minQty
+                wsR.Cells(r + 1, 12).Value = -minQty
+            End If
+            r = r + 2
+        Else
+            r = r + 1
+        End If
+    Loop
+
+    ' -- Grand total row --
+    lastRow = wsR.Cells(wsR.Rows.Count, 3).End(xlUp).Row + 2
+    wsR.Cells(lastRow, 10).Value = "GRAND TOTAL NET:"
+    wsR.Cells(lastRow, 11).Value = grandTotal
+    wsR.Range(wsR.Cells(lastRow, 10), wsR.Cells(lastRow, 11)).Font.Bold = True
+
+    wsR.Columns(13).Delete
+    wsR.Columns("A:L").AutoFit
+
+    ' Legend for the DVP/FOP shading, placed off to the side of the table
+    wsR.Cells(2, 14).Value = "DVP = shares must be delivered"
+    wsR.Cells(2, 14).Interior.Color = RGB(255, 224, 178)
+    wsR.Cells(3, 14).Value = "FOP = cash only, quantities fully net off"
+    wsR.Cells(3, 14).Interior.Color = RGB(214, 234, 248)
+    wsR.Columns("N").AutoFit
+
+    If wsRej.Cells(wsRej.Rows.Count, 3).End(xlUp).Row > 1 Then wsRej.Columns("A:M").AutoFit
+    wsR.Activate
+End Sub
+
+
+'===============================================================================
+' UTILITIES
+'===============================================================================
+Private Function GetOrCreateSheet(sheetName As String) As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sheetName
+    End If
+    Set GetOrCreateSheet = ws
+End Function
+
+Private Sub DeleteSheetIfExists(sheetName As String)
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    If Not ws Is Nothing Then
+        Application.DisplayAlerts = False
+        ws.Delete
+        Application.DisplayAlerts = True
+    End If
+End Sub
+
+Private Sub ClearTables(ws As Worksheet)
+    Dim lo As ListObject
+    For Each lo In ws.ListObjects
+        lo.Delete
+    Next lo
+End Sub
+
+Private Sub MakeTable(ws As Worksheet, tableName As String)
+    Dim lastRow As Long, lastCol As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Then Exit Sub
+    ws.ListObjects.Add(xlSrcRange, ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)), , xlYes).Name = tableName
+End Sub
+
+Private Function SafeCDbl(val As Variant) As Double
+    On Error Resume Next
+    SafeCDbl = CDbl(Replace(CStr(val), ",", ""))
+    If Err.Number <> 0 Then SafeCDbl = 0
+    On Error GoTo 0
+End Function
